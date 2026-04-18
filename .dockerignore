@@ -1,11 +1,14 @@
 .git
 .venv
 .env
+.env.local
 .claude
 .idea
 .vscode
 .DS_Store
 __pycache__
+*.pyc
+*.pyo
 *.egg-info
 build
 dist
@@ -13,3 +16,7 @@ results
 eval_results
 Dockerfile
 docker-compose.yml
+stock-screener
+tests
+assets
+.pytest_cache
