@@ -6,6 +6,7 @@ Endpoints :
   POST /trading-agents/stream     → SSE, un event par étape du graph
 """
 
+import concurrent.futures
 import json
 from datetime import date, timedelta
 from typing import AsyncGenerator, List, Optional
@@ -35,6 +36,7 @@ class RunRequest(BaseModel):
     ticker: str
     trade_date: Optional[str] = None
     analysts: Optional[List[str]] = None
+    analysts_preset: Optional[str] = None  # "standard" | "fast"
     llm_provider: Optional[str] = "openai"
     deep_think_llm: Optional[str] = "gpt-4o"
     quick_think_llm: Optional[str] = "gpt-4o-mini"
@@ -44,6 +46,7 @@ class RunRequest(BaseModel):
     openai_reasoning_effort: Optional[str] = None
     anthropic_effort: Optional[str] = None
     google_thinking_level: Optional[str] = None
+    timeout_seconds: Optional[int] = 180
 
 
 def build_config(req: RunRequest) -> dict:
@@ -54,6 +57,10 @@ def build_config(req: RunRequest) -> dict:
     config["max_debate_rounds"]       = req.max_debate_rounds
     config["max_risk_discuss_rounds"] = req.max_risk_discuss_rounds
     config["output_language"]         = req.output_language
+    # backend_url default in DEFAULT_CONFIG est OpenAI — invalide pour Anthropic/Google.
+    # On le force à None pour les providers non-OpenAI afin que les SDK utilisent leur URL par défaut.
+    if req.llm_provider and req.llm_provider.lower() != "openai":
+        config["backend_url"] = None
     config["data_vendors"] = {
         "core_stock_apis":      "yfinance",
         "technical_indicators": "yfinance",
@@ -90,14 +97,39 @@ def health():
     return {"status": "ok"}
 
 
+def _resolve_analysts(req: RunRequest) -> List[str]:
+    """Résout la liste des analysts depuis analysts_preset ou analysts explicites."""
+    if req.analysts:
+        return req.analysts
+    if req.analysts_preset == "fast":
+        return ["fundamentals", "news"]
+    # "standard" ou non spécifié
+    return ["market", "fundamentals", "social", "news"]
+
+
 @app.post("/trading-agents/run")
 def run(req: RunRequest):
     """Réponse JSON complète — attend la fin de l'analyse."""
     trade_date = req.trade_date or str(date.today() - timedelta(days=1))
-    analysts   = req.analysts or ["market", "fundamentals", "social", "news"]
+    analysts   = _resolve_analysts(req)
+    timeout    = req.timeout_seconds or 180
+
+    def _do_run():
+        ta = TradingAgentsGraph(selected_analysts=analysts, debug=True, config=build_config(req))
+        return ta.propagate(req.ticker, trade_date)
+
     try:
-        ta = TradingAgentsGraph(selected_analysts=analysts, debug=False, config=build_config(req))
-        final_state, decision = ta.propagate(req.ticker, trade_date)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_do_run)
+            try:
+                final_state, decision = future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                raise HTTPException(
+                    status_code=408,
+                    detail=f"TradingAgents timeout après {timeout}s — essayez analysts_preset='fast' ou augmentez timeout_seconds",
+                )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -108,7 +140,7 @@ def run(req: RunRequest):
 async def stream(req: RunRequest):
     """SSE — émet un event à chaque étape complétée du graph."""
     trade_date = req.trade_date or str(date.today() - timedelta(days=1))
-    analysts   = req.analysts or ["market", "fundamentals", "social", "news"]
+    analysts   = _resolve_analysts(req)
 
     async def generate() -> AsyncGenerator[str, None]:
         try:
